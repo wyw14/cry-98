@@ -1,0 +1,42 @@
+package api
+
+import (
+	"log/slog"
+	"net/http"
+
+	"github.com/google/uuid"
+)
+
+type responseRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (r *responseRecorder) WriteHeader(status int) {
+	r.status = status
+	r.ResponseWriter.WriteHeader(status)
+}
+
+func requestID(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		id := request.Header.Get("X-Request-ID")
+		if id == "" {
+			id = uuid.NewString()
+		}
+		writer.Header().Set("X-Request-ID", id)
+		next.ServeHTTP(writer, request)
+	})
+}
+
+func recoverPanic(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		recorder := &responseRecorder{ResponseWriter: writer, status: http.StatusOK}
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				slog.Error("http handler panic", "path", request.URL.Path, "error", recovered)
+				writeError(recorder, http.StatusInternalServerError, "internal error")
+			}
+		}()
+		next.ServeHTTP(recorder, request)
+	})
+}
