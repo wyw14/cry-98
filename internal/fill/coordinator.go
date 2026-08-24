@@ -50,13 +50,30 @@ func NewCoordinator(circuits *circuit.Manager, circuitList *circuit.Registry, ro
 }
 
 func (c *Coordinator) Start(ctx context.Context, vesselID string, origin model.FillOrigin, liters float64) (model.FillSession, error) {
-	c.mu.RLock()
-	if _, exists := c.active[vesselID]; exists {
-		c.mu.RUnlock()
+	session, err := model.NewFillSession(vesselID, origin, 1, liters, c.now())
+	if err != nil {
+		return model.FillSession{}, err
+	}
+
+	// Claim the vessel's session slot atomically. The automatic low-level entry
+	// and the manual operator entry both flow through Start, so this single claim
+	// is where they contend: only one Start may hold the slot for a vessel at a
+	// time. A concurrent caller observes the claim and returns ErrActiveSession
+	// instead of provisioning a second fill that would double-open the valve.
+	if !c.claimStart(vesselID, session.ID) {
 		return model.FillSession{}, ErrActiveSession
 	}
-	c.mu.RUnlock()
-	time.Sleep(10 * time.Millisecond)
+
+	// Release the slot unless Start commits a fully provisioned session. Every
+	// failure path below already tears down its circuit and vessel side effects;
+	// the deferred release ensures the vessel becomes eligible to start again.
+	committed := false
+	defer func() {
+		if !committed {
+			c.releaseStartClaim(vesselID, session.ID)
+		}
+	}()
+
 	candidates := c.circuitList.List()
 	if len(candidates) == 0 {
 		return model.FillSession{}, circuit.ErrCircuitBusy
@@ -64,10 +81,6 @@ func (c *Coordinator) Start(ctx context.Context, vesselID string, origin model.F
 	selected := candidates[0]
 	if origin == model.FillManual && len(candidates) > 1 {
 		selected = candidates[1]
-	}
-	session, err := model.NewFillSession(vesselID, origin, 1, liters, c.now())
-	if err != nil {
-		return model.FillSession{}, err
 	}
 	reservation, err := c.circuits.Reserve(selected.ID, vesselID, session.ID, c.now())
 	if err != nil {
@@ -111,9 +124,34 @@ func (c *Coordinator) Start(ctx context.Context, vesselID string, origin model.F
 	}
 	c.mu.Lock()
 	c.sessions[session.ID] = session
-	c.active[vesselID] = session.ID
 	c.mu.Unlock()
+	committed = true
 	return session, nil
+}
+
+// claimStart reserves the session slot for vesselID under the coordinator write
+// lock. It returns false when the vessel already holds an active or in-progress
+// start, so concurrent automatic and manual entries share a single eligibility
+// point instead of each creating their own session.
+func (c *Coordinator) claimStart(vesselID string, sessionID uuid.UUID) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, exists := c.active[vesselID]; exists {
+		return false
+	}
+	c.active[vesselID] = sessionID
+	return true
+}
+
+// releaseStartClaim frees the slot claimed by claimStart when Start fails before
+// committing a session. The sessionID guard ensures we never clear a slot that a
+// later, successful start reassigned to a different session.
+func (c *Coordinator) releaseStartClaim(vesselID string, sessionID uuid.UUID) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if current, ok := c.active[vesselID]; ok && current == sessionID {
+		delete(c.active, vesselID)
+	}
 }
 
 func (c *Coordinator) StartAutomatic(ctx context.Context, vesselID string, liters float64) (model.FillSession, error) {
