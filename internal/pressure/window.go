@@ -44,11 +44,21 @@ func (w *Window) Add(sample model.Sample) bool {
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.epoch == 0 {
+	switch {
+	case w.epoch == 0:
+		// The first pressure observation seeds the calibration generation.
 		w.epoch = sample.CalibrationEpoch
-	}
-	if sample.CalibrationEpoch != w.epoch {
+	case sample.CalibrationEpoch > w.epoch:
+		// The probe was recalibrated or replaced mid-soak. Stale readings
+		// from the previous generation can no longer testify to stability,
+		// so discard them and re-accumulate a full window for the new
+		// generation starting with this sample.
 		w.epoch = sample.CalibrationEpoch
+		w.samples = nil
+	case sample.CalibrationEpoch < w.epoch:
+		// An obsolete-generation sample (e.g. buffered before a
+		// recalibration) must not contribute to a stability decision.
+		return false
 	}
 	w.samples = append(w.samples, WindowSample{
 		Value:            sample.Value,
@@ -64,16 +74,20 @@ func (w *Window) Add(sample model.Sample) bool {
 func (w *Window) Stable() bool {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
-	if len(w.samples) < w.capacity {
+	// A full window of the current calibration generation must accumulate
+	// before pressure stability can be declared. Stale-generation readings
+	// never count toward that quorum, so a recalibration mid-soak forces
+	// the window to refill from the new generation.
+	if len(w.samples) < w.capacity || w.epoch == 0 {
 		return false
 	}
 	minimum, maximum := w.samples[0].Value, w.samples[0].Value
 	for _, sample := range w.samples[1:] {
-		minimum = minFloat(minimum, sample.Value)
-		maximum = maxFloat(maximum, sample.Value)
 		if sample.CalibrationEpoch != w.epoch {
 			return false
 		}
+		minimum = minFloat(minimum, sample.Value)
+		maximum = maxFloat(maximum, sample.Value)
 	}
 	return maximum-minimum <= w.spread
 }
