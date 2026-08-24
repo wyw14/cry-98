@@ -56,6 +56,17 @@ func (s *CompletionService) Complete(ctx context.Context, sessionID uuid.UUID) (
 	if err != nil {
 		return model.FillSession{}, err
 	}
+	// Persist the soak verification evidence before publishing the completed
+	// status or releasing the shared supply circuit. If the journal cannot
+	// durably record the verification, the session stays soaking so completion
+	// can be retried instead of announcing a fill whose proof was never saved.
+	event, err := model.NewEvent("fills", "fill.soak_verified", session.ID.String(), result, s.now())
+	if err != nil {
+		return model.FillSession{}, err
+	}
+	if _, err := s.journal.Append(event); err != nil {
+		return model.FillSession{}, err
+	}
 	if err := s.coordinator.routes.Close(ctx, session.ID); err != nil {
 		_ = s.coordinator.circuits.RetainFault(session.CircuitID, session.ID)
 		return model.FillSession{}, err
@@ -67,12 +78,5 @@ func (s *CompletionService) Complete(ctx context.Context, sessionID uuid.UUID) (
 		return model.FillSession{}, err
 	}
 	s.coordinator.finishState(completed)
-	event, err := model.NewEvent("fills", "fill.soak_verified", session.ID.String(), result, s.now())
-	if err != nil {
-		return model.FillSession{}, err
-	}
-	if _, err := s.journal.Append(event); err != nil {
-		return model.FillSession{}, err
-	}
 	return completed, nil
 }
